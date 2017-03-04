@@ -10,10 +10,11 @@ import threading
 from contextlib import contextmanager
 
 from aiohttp import web
+from aiohttp.test_utils import unused_port as get_test_instance_port  # noqa
 
 from homeassistant import core as ha, loader
-from homeassistant.bootstrap import (
-    setup_component, async_prepare_setup_component)
+from homeassistant.bootstrap import setup_component, DATA_SETUP
+from homeassistant.config import async_process_component_config
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.entity import ToggleEntity
 from homeassistant.helpers.restore_state import DATA_RESTORE_CACHE
@@ -23,15 +24,16 @@ import homeassistant.util.yaml as yaml
 from homeassistant.const import (
     STATE_ON, STATE_OFF, DEVICE_DEFAULT_NAME, EVENT_TIME_CHANGED,
     EVENT_STATE_CHANGED, EVENT_PLATFORM_DISCOVERED, ATTR_SERVICE,
-    ATTR_DISCOVERED, SERVER_PORT)
+    ATTR_DISCOVERED, EVENT_HOMEASSISTANT_STOP)
 from homeassistant.components import sun, mqtt, recorder
 from homeassistant.components.http.auth import auth_middleware
 from homeassistant.components.http.const import (
     KEY_USE_X_FORWARDED_FOR, KEY_BANS_ENABLED, KEY_TRUSTED_NETWORKS)
-from homeassistant.util.async import run_callback_threadsafe
+from homeassistant.util.async import (
+    run_callback_threadsafe, run_coroutine_threadsafe)
 
-_TEST_INSTANCE_PORT = SERVER_PORT
 _LOGGER = logging.getLogger(__name__)
+INST_COUNT = 0
 
 
 def get_test_config_dir(*add_path):
@@ -85,17 +87,22 @@ def get_test_home_assistant():
 @asyncio.coroutine
 def async_test_home_assistant(loop):
     """Return a Home Assistant object pointing at test config dir."""
+    global INST_COUNT
+    INST_COUNT += 1
     loop._thread_ident = threading.get_ident()
 
     hass = ha.HomeAssistant(loop)
+
+    orig_async_add_job = hass.async_add_job
 
     def async_add_job(target, *args):
         """Add a magic mock."""
         if isinstance(target, MagicMock):
             return
-        hass._async_add_job_tracking(target, *args)
+        return orig_async_add_job(target, *args)
 
     hass.async_add_job = async_add_job
+    hass.async_track_tasks()
 
     hass.config.location_name = 'test home'
     hass.config.config_dir = get_test_config_dir()
@@ -122,19 +129,14 @@ def async_test_home_assistant(loop):
 
     hass.async_start = mock_async_start
 
+    @ha.callback
+    def clear_instance(event):
+        global INST_COUNT
+        INST_COUNT -= 1
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, clear_instance)
+
     return hass
-
-
-def get_test_instance_port():
-    """Return unused port for running test instance.
-
-    The socket that holds the default port does not get released when we stop
-    HA in a different test case. Until I have figured out what is going on,
-    let's run each test on a different port.
-    """
-    global _TEST_INSTANCE_PORT
-    _TEST_INSTANCE_PORT += 1
-    return _TEST_INSTANCE_PORT
 
 
 def mock_service(hass, domain, service):
@@ -219,7 +221,7 @@ def mock_state_change_event(hass, new_state, old_state=None):
 def mock_http_component(hass, api_password=None):
     """Mock the HTTP component."""
     hass.http = MagicMock(api_password=api_password)
-    hass.config.components.add('http')
+    mock_component(hass, 'http')
     hass.http.views = {}
 
     def mock_register_view(view):
@@ -255,6 +257,19 @@ def mock_mqtt_component(hass):
             }
         })
         return mock_mqtt
+
+
+def mock_component(hass, component):
+    """Mock a component is setup."""
+    setup_tasks = hass.data.get(DATA_SETUP)
+    if setup_tasks is None:
+        setup_tasks = hass.data[DATA_SETUP] = {}
+
+    if component not in setup_tasks:
+        AssertionError("Component {} is already setup".format(component))
+
+    hass.config.components.add(component)
+    setup_tasks[component] = asyncio.Task(mock_coro(True), loop=hass.loop)
 
 
 class MockModule(object):
@@ -428,10 +443,10 @@ def assert_setup_component(count, domain=None):
     """
     config = {}
 
-    @asyncio.coroutine
+    @ha.callback
     def mock_psc(hass, config_input, domain):
         """Mock the prepare_setup_component to capture config."""
-        res = yield from async_prepare_setup_component(
+        res = async_process_component_config(
             hass, config_input, domain)
         config[domain] = None if res is None else res.get(domain)
         _LOGGER.debug('Configuration for %s, Validated: %s, Original %s',
@@ -439,7 +454,7 @@ def assert_setup_component(count, domain=None):
         return res
 
     assert isinstance(config, dict)
-    with patch('homeassistant.bootstrap.async_prepare_setup_component',
+    with patch('homeassistant.config.async_process_component_config',
                mock_psc):
         yield config
 
@@ -454,15 +469,17 @@ def assert_setup_component(count, domain=None):
         .format(count, res_len, res)
 
 
-def init_recorder_component(hass, add_config=None, db_ready_callback=None):
+def init_recorder_component(hass, add_config=None):
     """Initialize the recorder."""
     config = dict(add_config) if add_config else {}
     config[recorder.CONF_DB_URL] = 'sqlite://'  # In memory DB
 
-    assert setup_component(hass, recorder.DOMAIN,
-                           {recorder.DOMAIN: config})
-    assert recorder.DOMAIN in hass.config.components
-    recorder.get_instance().block_till_db_ready()
+    with patch('homeassistant.components.recorder.migration.migrate_schema'):
+        assert setup_component(hass, recorder.DOMAIN,
+                               {recorder.DOMAIN: config})
+        assert recorder.DOMAIN in hass.config.components
+        run_coroutine_threadsafe(
+            recorder.wait_connection_ready(hass), hass.loop).result()
     _LOGGER.info("In-memory recorder successfully started")
 
 
